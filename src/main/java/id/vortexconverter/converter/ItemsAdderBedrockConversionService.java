@@ -1,6 +1,7 @@
 
 package id.vortexconverter.converter;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -19,8 +20,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -37,6 +40,12 @@ public class ItemsAdderBedrockConversionService {
 
     private static final String MANIFEST_ENTRY =
             "manifest.json";
+
+    private static final String RENDER_CONTROLLER_ENTRY =
+            "render_controllers/vortexconverter.render_controllers.json";
+
+    private static final String RENDER_CONTROLLER_IDENTIFIER =
+            "controller.render.default";
 
     private final ItemsAdderConfigParser parser;
     private final ItemsAdderCustomMappingGenerator mappingGenerator;
@@ -144,7 +153,6 @@ public class ItemsAdderBedrockConversionService {
         boolean rollbackFailed = false;
 
         try {
-            // Backup dibuat sebelum file lama disentuh.
             packBackup = createBackup(packTarget);
             mappingBackup = createBackup(mappingTarget);
 
@@ -171,8 +179,11 @@ public class ItemsAdderBedrockConversionService {
                 );
             }
 
-            // Pastikan pack benar-benar ZIP valid dan atlas tersedia.
-            validateResourcePack(packFile, mappingResult.mapping());
+            PackValidationResult packValidation =
+                    validateResourcePack(
+                            packFile,
+                            mappingResult.mapping()
+                    );
 
             ItemsAdderMappingExporter.ExportResult exportResult =
                     exporter.export(
@@ -194,7 +205,6 @@ public class ItemsAdderBedrockConversionService {
                 );
             }
 
-            // Pastikan file hasil ekspor masih valid.
             validateExportedMapping(mappingFile);
 
             List<String> warnings = new ArrayList<>(
@@ -203,12 +213,6 @@ public class ItemsAdderBedrockConversionService {
 
             warnings.addAll(validation.warnings());
             warnings.addAll(packResult.warnings());
-
-            if (parseResult.hasErrors()) {
-                warnings.add(
-                        "Sebagian konfigurasi ItemsAdder mengalami kesalahan."
-                );
-            }
 
             warnings.add(
                     "Sumber metadata: ItemsAdder/contents."
@@ -220,8 +224,37 @@ public class ItemsAdderBedrockConversionService {
             );
 
             warnings.add(
-                    "Resource pack telah diperiksa sebagai ZIP valid."
+                    "Resource pack berhasil melewati pemeriksaan ZIP."
             );
+
+            warnings.add(
+                    "Manifest dan texture atlas berhasil diperiksa."
+            );
+
+            warnings.add(
+                    "PNG yang dirujuk atlas: "
+                            + packValidation.checkedTextures()
+            );
+
+            warnings.add(
+                    "Geometry JSON diperiksa: "
+                            + packValidation.checkedGeometries()
+            );
+
+            warnings.add(
+                    "Attachable JSON diperiksa: "
+                            + packValidation.checkedAttachables()
+            );
+
+            if (packValidation.renderControllerFound()) {
+                warnings.add(
+                        "Render Controller ditemukan dan struktur dasarnya valid."
+                );
+            } else {
+                warnings.add(
+                        "Tidak ada attachable yang memerlukan Render Controller."
+                );
+            }
 
             warnings.add(
                     "Semua icon mapping telah diperiksa terhadap texture atlas."
@@ -233,6 +266,11 @@ public class ItemsAdderBedrockConversionService {
 
             warnings.add(
                     "File output berada di Geyser packs dan custom_mappings."
+            );
+
+            warnings.add(
+                    "Validasi struktur JSON tidak menjamin seluruh model "
+                            + "akan tampil sempurna di client Bedrock."
             );
 
             return new ConversionResult(
@@ -290,7 +328,6 @@ public class ItemsAdderBedrockConversionService {
             throw exception;
 
         } finally {
-            // Jangan hapus backup jika rollback gagal.
             if (!rollbackFailed) {
                 deleteBackup(packBackup);
                 deleteBackup(mappingBackup);
@@ -298,7 +335,7 @@ public class ItemsAdderBedrockConversionService {
         }
     }
 
-    private void validateResourcePack(
+    private PackValidationResult validateResourcePack(
             File packFile,
             JsonObject mapping
     ) throws IOException {
@@ -311,68 +348,47 @@ public class ItemsAdderBedrockConversionService {
 
         try (ZipFile zip = new ZipFile(packFile)) {
 
-            ZipEntry manifestEntry = zip.getEntry(MANIFEST_ENTRY);
-            ZipEntry atlasEntry = zip.getEntry(ATLAS_ENTRY);
+            Set<String> entries = new HashSet<>();
 
-            if (manifestEntry == null) {
-                throw new IOException(
-                        "Resource pack tidak memiliki manifest.json."
-                );
-            }
+            var enumeration = zip.entries();
 
-            if (atlasEntry == null) {
-                throw new IOException(
-                        "Resource pack tidak memiliki "
-                                + ATLAS_ENTRY
-                );
-            }
+            while (enumeration.hasMoreElements()) {
+                ZipEntry entry = enumeration.nextElement();
 
-            JsonObject manifest;
-
-            try (InputStream input = zip.getInputStream(manifestEntry);
-                 InputStreamReader reader = new InputStreamReader(
-                         input,
-                         StandardCharsets.UTF_8
-                 )) {
-
-                JsonElement element = JsonParser.parseReader(reader);
-
-                if (!element.isJsonObject()) {
-                    throw new IOException(
-                            "manifest.json bukan JSON object."
-                    );
+                if (!entry.isDirectory()) {
+                    entries.add(entry.getName());
                 }
-
-                manifest = element.getAsJsonObject();
             }
+
+            JsonObject manifest = readJsonObject(
+                    zip,
+                    MANIFEST_ENTRY
+            );
 
             if (!manifest.has("header")
                     || !manifest.get("header").isJsonObject()
                     || !manifest.has("modules")
-                    || !manifest.get("modules").isJsonArray()) {
+                    || !manifest.get("modules").isJsonArray()
+                    || manifest.getAsJsonArray("modules").isEmpty()) {
                 throw new IOException(
                         "Struktur manifest.json tidak lengkap."
                 );
             }
 
-            JsonObject atlas;
+            JsonObject header = manifest.getAsJsonObject("header");
 
-            try (InputStream input = zip.getInputStream(atlasEntry);
-                 InputStreamReader reader = new InputStreamReader(
-                         input,
-                         StandardCharsets.UTF_8
-                 )) {
-
-                JsonElement element = JsonParser.parseReader(reader);
-
-                if (!element.isJsonObject()) {
-                    throw new IOException(
-                            "item_texture.json bukan JSON object."
-                    );
-                }
-
-                atlas = element.getAsJsonObject();
+            if (!header.has("uuid")
+                    || !header.has("version")
+                    || !header.has("min_engine_version")) {
+                throw new IOException(
+                        "Header manifest tidak lengkap."
+                );
             }
+
+            JsonObject atlas = readJsonObject(
+                    zip,
+                    ATLAS_ENTRY
+            );
 
             if (!atlas.has("texture_data")
                     || !atlas.get("texture_data").isJsonObject()) {
@@ -384,11 +400,175 @@ public class ItemsAdderBedrockConversionService {
             JsonObject textureData =
                     atlas.getAsJsonObject("texture_data");
 
-            validateMappingIcons(mapping, textureData);
+            int checkedTextures = validateAtlasTextures(
+                    textureData,
+                    entries
+            );
+
+            int checkedIcons = validateMappingIcons(
+                    mapping,
+                    textureData
+            );
+
+            int checkedGeometries = validateGeometryFiles(
+                    zip,
+                    entries
+            );
+
+            int checkedAttachables = validateAttachables(
+                    zip,
+                    entries
+            );
+
+            boolean renderControllerFound =
+                    entries.contains(RENDER_CONTROLLER_ENTRY);
+
+            if (checkedAttachables > 0 && !renderControllerFound) {
+                throw new IOException(
+                        "Attachable ditemukan tetapi Render Controller "
+                                + "tidak ada di resource pack."
+                );
+            }
+
+            if (renderControllerFound) {
+                validateRenderController(zip);
+
+                if (checkedAttachables == 0) {
+                    throw new IOException(
+                            "Render Controller tersedia tetapi tidak ada "
+                                    + "attachable yang menggunakannya."
+                    );
+                }
+            }
+
+            return new PackValidationResult(
+                    checkedTextures,
+                    checkedIcons,
+                    checkedGeometries,
+                    checkedAttachables,
+                    renderControllerFound
+            );
         }
     }
 
-    private void validateMappingIcons(
+    private JsonObject readJsonObject(
+            ZipFile zip,
+            String entryName
+    ) throws IOException {
+
+        ZipEntry entry = zip.getEntry(entryName);
+
+        if (entry == null || entry.isDirectory()) {
+            throw new IOException(
+                    "File resource pack tidak ditemukan: " + entryName
+            );
+        }
+
+        try (InputStream input = zip.getInputStream(entry);
+             InputStreamReader reader = new InputStreamReader(
+                     input,
+                     StandardCharsets.UTF_8
+             )) {
+
+            JsonElement element;
+
+            try {
+                element = JsonParser.parseReader(reader);
+            } catch (RuntimeException exception) {
+                throw new IOException(
+                        "JSON tidak valid: " + entryName,
+                        exception
+                );
+            }
+
+            if (element == null || !element.isJsonObject()) {
+                throw new IOException(
+                        "JSON bukan object: " + entryName
+                );
+            }
+
+            return element.getAsJsonObject();
+        }
+    }
+
+    private int validateAtlasTextures(
+            JsonObject textureData,
+            Set<String> entries
+    ) throws IOException {
+
+        int checked = 0;
+
+        for (Map.Entry<String, JsonElement> entry
+                : textureData.entrySet()) {
+
+            if (!entry.getValue().isJsonObject()) {
+                throw new IOException(
+                        "Texture atlas entry bukan object: "
+                                + entry.getKey()
+                );
+            }
+
+            JsonObject textureEntry = entry.getValue().getAsJsonObject();
+
+            if (!textureEntry.has("textures")) {
+                throw new IOException(
+                        "Texture atlas tidak memiliki textures: "
+                                + entry.getKey()
+                );
+            }
+
+            JsonElement texturesElement = textureEntry.get("textures");
+
+            if (!texturesElement.isJsonArray()) {
+                throw new IOException(
+                        "Texture atlas textures harus berupa array: "
+                                + entry.getKey()
+                );
+            }
+
+            JsonArray textures = texturesElement.getAsJsonArray();
+
+            if (textures.isEmpty()) {
+                throw new IOException(
+                        "Texture atlas textures kosong: "
+                                + entry.getKey()
+                );
+            }
+
+            for (JsonElement textureElement : textures) {
+
+                if (!textureElement.isJsonPrimitive()
+                        || !textureElement.getAsJsonPrimitive().isString()) {
+                    throw new IOException(
+                            "Path texture tidak valid: " + entry.getKey()
+                    );
+                }
+
+                String texturePath = textureElement.getAsString();
+
+                String normalizedPath = normalizePackPath(texturePath);
+
+                if (!entries.contains(normalizedPath + ".png")) {
+                    throw new IOException(
+                            "File PNG tidak ditemukan di pack: "
+                                    + normalizedPath + ".png"
+                    );
+                }
+
+                checked++;
+            }
+        }
+
+        if (checked == 0) {
+            throw new IOException(
+                    "Tidak ada file texture yang berhasil diperiksa."
+            );
+        }
+
+        return checked;
+    }
+
+    private int validateMappingIcons(
             JsonObject mapping,
             JsonObject textureData
     ) throws IOException {
@@ -468,17 +648,414 @@ public class ItemsAdderBedrockConversionService {
                     "Tidak ada icon mapping yang berhasil diperiksa."
             );
         }
+
+        return checked;
+    }
+
+    private int validateGeometryFiles(
+            ZipFile zip,
+            Set<String> entries
+    ) throws IOException {
+
+        int checked = 0;
+
+        for (String entryName : entries) {
+
+            if (!entryName.startsWith("models/entity/")
+                    || !entryName.endsWith(".geo.json")) {
+                continue;
+            }
+
+            JsonObject root = readJsonObject(zip, entryName);
+
+            if (!root.has("minecraft:geometry")
+                    || !root.get("minecraft:geometry").isJsonArray()) {
+                throw new IOException(
+                        "Geometry JSON tidak memiliki minecraft:geometry: "
+                                + entryName
+                );
+            }
+
+            JsonArray geometries =
+                    root.getAsJsonArray("minecraft:geometry");
+
+            if (geometries.isEmpty()) {
+                throw new IOException(
+                        "Geometry array kosong: " + entryName
+                );
+            }
+
+            for (JsonElement geometryElement : geometries) {
+
+                if (!geometryElement.isJsonObject()) {
+                    throw new IOException(
+                            "Geometry entry bukan object: " + entryName
+                    );
+                }
+
+                JsonObject geometry = geometryElement.getAsJsonObject();
+
+                if (!geometry.has("description")
+                        || !geometry.get("description").isJsonObject()
+                        || !geometry.has("bones")
+                        || !geometry.get("bones").isJsonArray()) {
+                    throw new IOException(
+                            "Struktur geometry tidak lengkap: " + entryName
+                    );
+                }
+
+                JsonObject description =
+                        geometry.getAsJsonObject("description");
+
+                if (!description.has("identifier")
+                        || !description.has("texture_width")
+                        || !description.has("texture_height")) {
+                    throw new IOException(
+                            "Geometry description tidak lengkap: "
+                                    + entryName
+                    );
+                }
+
+                JsonArray bones = geometry.getAsJsonArray("bones");
+
+                if (bones.isEmpty()) {
+                    throw new IOException(
+                            "Geometry tidak memiliki bones: " + entryName
+                    );
+                }
+
+                for (JsonElement boneElement : bones) {
+
+                    if (!boneElement.isJsonObject()) {
+                        throw new IOException(
+                                "Bone bukan object: " + entryName
+                        );
+                    }
+
+                    JsonObject bone = boneElement.getAsJsonObject();
+
+                    if (!bone.has("name")
+                            || !bone.has("cubes")
+                            || !bone.get("cubes").isJsonArray()) {
+                        throw new IOException(
+                                "Bone tidak memiliki name/cubes: "
+                                        + entryName
+                        );
+                    }
+
+                    if (bone.getAsJsonArray("cubes").isEmpty()) {
+                        throw new IOException(
+                                "Bone tidak memiliki cube: " + entryName
+                        );
+                    }
+                }
+            }
+
+            checked++;
+        }
+
+        return checked;
+    }
+
+    private int validateAttachables(
+            ZipFile zip,
+            Set<String> entries
+    ) throws IOException {
+
+        int checked = 0;
+
+        for (String entryName : entries) {
+
+            if (!entryName.startsWith("attachables/")
+                    || !entryName.endsWith(".json")) {
+                continue;
+            }
+
+            JsonObject root = readJsonObject(zip, entryName);
+
+            if (!root.has("minecraft:attachable")
+                    || !root.get("minecraft:attachable").isJsonObject()) {
+                throw new IOException(
+                        "Attachable JSON tidak memiliki minecraft:attachable: "
+                                + entryName
+                );
+            }
+
+            JsonObject attachable =
+                    root.getAsJsonObject("minecraft:attachable");
+
+            if (!attachable.has("description")
+                    || !attachable.get("description").isJsonObject()) {
+                throw new IOException(
+                        "Attachable tidak memiliki description: "
+                                + entryName
+                );
+            }
+
+            JsonObject description =
+                    attachable.getAsJsonObject("description");
+
+            if (!description.has("identifier")
+                    || !description.has("geometry")
+                    || !description.get("geometry").isJsonObject()
+                    || !description.has("textures")
+                    || !description.get("textures").isJsonObject()
+                    || !description.has("materials")
+                    || !description.get("materials").isJsonObject()
+                    || !description.has("render_controllers")
+                    || !description.get("render_controllers").isJsonArray()) {
+                throw new IOException(
+                        "Struktur attachable tidak lengkap: " + entryName
+                );
+            }
+
+            JsonObject geometries =
+                    description.getAsJsonObject("geometry");
+
+            JsonObject textures =
+                    description.getAsJsonObject("textures");
+
+            JsonArray controllers =
+                    description.getAsJsonArray("render_controllers");
+
+            if (geometries.isEmpty() || textures.isEmpty()
+                    || controllers.isEmpty()) {
+                throw new IOException(
+                        "Attachable memiliki referensi kosong: " + entryName
+                );
+            }
+
+            for (Map.Entry<String, JsonElement> geometryEntry
+                    : geometries.entrySet()) {
+
+                if (!geometryEntry.getValue().isJsonPrimitive()) {
+                    throw new IOException(
+                            "Geometry reference tidak valid: " + entryName
+                    );
+                }
+
+                String geometryIdentifier =
+                        geometryEntry.getValue().getAsString();
+
+                if (!containsGeometryIdentifier(
+                        zip,
+                        entries,
+                        geometryIdentifier
+                )) {
+                    throw new IOException(
+                            "Geometry tidak ditemukan untuk attachable "
+                                    + entryName + ": "
+                                    + geometryIdentifier
+                    );
+                }
+            }
+
+            for (Map.Entry<String, JsonElement> textureEntry
+                    : textures.entrySet()) {
+
+                if (!textureEntry.getValue().isJsonPrimitive()) {
+                    throw new IOException(
+                            "Texture reference tidak valid: " + entryName
+                    );
+                }
+
+                String texturePath = normalizePackPath(
+                        textureEntry.getValue().getAsString()
+                );
+
+                if (!entries.contains(texturePath + ".png")) {
+                    throw new IOException(
+                            "Texture attachable tidak ditemukan: "
+                                    + texturePath + ".png"
+                    );
+                }
+            }
+
+            boolean controllerMatched = false;
+
+            for (JsonElement controllerElement : controllers) {
+
+                if (!controllerElement.isJsonPrimitive()
+                        || !controllerElement.getAsJsonPrimitive().isString()) {
+                    throw new IOException(
+                            "Render controller reference tidak valid: "
+                                    + entryName
+                    );
+                }
+
+                if (RENDER_CONTROLLER_IDENTIFIER.equals(
+                        controllerElement.getAsString()
+                )) {
+                    controllerMatched = true;
+                }
+            }
+
+            if (!controllerMatched) {
+                throw new IOException(
+                        "Attachable tidak menggunakan controller yang "
+                                + "dibuat VortexConverter: " + entryName
+                );
+            }
+
+            checked++;
+        }
+
+        return checked;
+    }
+
+    private boolean containsGeometryIdentifier(
+            ZipFile zip,
+            Set<String> entries,
+            String identifier
+    ) throws IOException {
+
+        for (String entryName : entries) {
+
+            if (!entryName.startsWith("models/entity/")
+                    || !entryName.endsWith(".geo.json")) {
+                continue;
+            }
+
+            JsonObject root = readJsonObject(zip, entryName);
+
+            JsonArray geometries =
+                    root.getAsJsonArray("minecraft:geometry");
+
+            if (geometries == null) {
+                continue;
+            }
+
+            for (JsonElement geometryElement : geometries) {
+
+                if (!geometryElement.isJsonObject()) {
+                    continue;
+                }
+
+                JsonObject geometry = geometryElement.getAsJsonObject();
+
+                if (!geometry.has("description")
+                        || !geometry.get("description").isJsonObject()) {
+                    continue;
+                }
+
+                JsonObject description =
+                        geometry.getAsJsonObject("description");
+
+                if (description.has("identifier")
+                        && identifier.equals(
+                                description.get("identifier").getAsString()
+                        )) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private void validateRenderController(
+            ZipFile zip
+    ) throws IOException {
+
+        JsonObject root = readJsonObject(
+                zip,
+                RENDER_CONTROLLER_ENTRY
+        );
+
+        if (!root.has("render_controllers")
+                || !root.get("render_controllers").isJsonObject()) {
+            throw new IOException(
+                    "Render Controller tidak memiliki render_controllers."
+            );
+        }
+
+        JsonObject controllers =
+                root.getAsJsonObject("render_controllers");
+
+        if (!controllers.has(RENDER_CONTROLLER_IDENTIFIER)
+                || !controllers.get(RENDER_CONTROLLER_IDENTIFIER).isJsonObject()) {
+            throw new IOException(
+                    "Controller " + RENDER_CONTROLLER_IDENTIFIER
+                            + " tidak ditemukan."
+            );
+        }
+
+        JsonObject controller =
+                controllers.getAsJsonObject(RENDER_CONTROLLER_IDENTIFIER);
+
+        if (!controller.has("geometry")
+                || !controller.get("geometry").isJsonPrimitive()
+                || !controller.has("materials")
+                || !controller.get("materials").isJsonArray()
+                || !controller.has("textures")
+                || !controller.get("textures").isJsonArray()) {
+            throw new IOException(
+                    "Struktur Render Controller tidak lengkap."
+            );
+        }
+
+        if (controller.getAsJsonArray("materials").isEmpty()
+                || controller.getAsJsonArray("textures").isEmpty()) {
+            throw new IOException(
+                    "Render Controller memiliki materials/textures kosong."
+            );
+        }
+
+        for (JsonElement materialElement
+                : controller.getAsJsonArray("materials")) {
+
+            if (!materialElement.isJsonObject()
+                    || materialElement.getAsJsonObject().isEmpty()) {
+                throw new IOException(
+                        "Render Controller materials entry tidak valid."
+                );
+            }
+        }
+    }
+
+    private String normalizePackPath(String path) throws IOException {
+
+        if (path == null || path.isBlank()) {
+            throw new IOException(
+                    "Path resource pack kosong."
+            );
+        }
+
+        String normalized = path.replace('\\', '/');
+
+        while (normalized.startsWith("/")) {
+            normalized = normalized.substring(1);
+        }
+
+        if (normalized.contains("../")
+                || normalized.equals("..")
+                || normalized.contains(":")) {
+            throw new IOException(
+                    "Path resource pack tidak aman: " + path
+            );
+        }
+
+        return normalized;
     }
 
     private void validateExportedMapping(File mappingFile)
             throws IOException {
 
-        JsonElement element = JsonParser.parseString(
-                Files.readString(
-                        mappingFile.toPath(),
-                        StandardCharsets.UTF_8
-                )
-        );
+        JsonElement element;
+
+        try {
+            element = JsonParser.parseString(
+                    Files.readString(
+                            mappingFile.toPath(),
+                            StandardCharsets.UTF_8
+                    )
+            );
+        } catch (RuntimeException exception) {
+            throw new IOException(
+                    "JSON mapping hasil ekspor tidak valid.",
+                    exception
+            );
+        }
 
         if (!element.isJsonObject()) {
             throw new IOException(
@@ -537,6 +1114,7 @@ public class ItemsAdderBedrockConversionService {
         }
 
         if (backup.existed()) {
+
             if (backup.backup() == null
                     || !Files.isRegularFile(backup.backup())) {
                 throw new IOException(
@@ -557,6 +1135,7 @@ public class ItemsAdderBedrockConversionService {
     }
 
     private String backupPath(FileBackup backup) {
+
         if (backup == null || backup.backup() == null) {
             return "tidak tersedia";
         }
@@ -565,6 +1144,7 @@ public class ItemsAdderBedrockConversionService {
     }
 
     private void deleteBackup(FileBackup backup) {
+
         if (backup == null || backup.backup() == null) {
             return;
         }
@@ -580,6 +1160,15 @@ public class ItemsAdderBedrockConversionService {
             Path target,
             Path backup,
             boolean existed
+    ) {
+    }
+
+    private record PackValidationResult(
+            int checkedTextures,
+            int checkedIcons,
+            int checkedGeometries,
+            int checkedAttachables,
+            boolean renderControllerFound
     ) {
     }
 
