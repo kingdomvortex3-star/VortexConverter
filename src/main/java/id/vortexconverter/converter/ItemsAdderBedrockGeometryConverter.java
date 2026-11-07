@@ -21,6 +21,7 @@ public final class ItemsAdderBedrockGeometryConverter {
 
     private static final double COORDINATE_OFFSET = 8.0;
     private static final double UV_REFERENCE_SIZE = 16.0;
+    private static final double EPSILON = 0.000001;
 
     private static final int MAX_ELEMENTS = 4096;
 
@@ -81,15 +82,9 @@ public final class ItemsAdderBedrockGeometryConverter {
         description.addProperty("visible_bounds_width", 4.0);
         description.addProperty("visible_bounds_height", 4.0);
 
-        JsonArray visibleBoundsOffset = vector(
-                0.0,
-                1.0,
-                0.0
-        );
-
         description.add(
                 "visible_bounds_offset",
-                visibleBoundsOffset
+                vector(0.0, 1.0, 0.0)
         );
 
         geometryObject.add("description", description);
@@ -100,6 +95,7 @@ public final class ItemsAdderBedrockGeometryConverter {
         int convertedFaces = 0;
         int skippedFaces = 0;
         int unsupportedRotations = 0;
+        int unsupportedUvRotations = 0;
 
         double uvScaleX = textureWidth / UV_REFERENCE_SIZE;
         double uvScaleY = textureHeight / UV_REFERENCE_SIZE;
@@ -142,7 +138,10 @@ public final class ItemsAdderBedrockGeometryConverter {
             double sizeY = toY - fromY;
             double sizeZ = toZ - fromZ;
 
-            if (sizeX <= 0 || sizeY <= 0 || sizeZ <= 0) {
+            if (sizeX <= EPSILON
+                    || sizeY <= EPSILON
+                    || sizeZ <= EPSILON) {
+
                 warnings.add(
                         "Element " + element.index()
                                 + " dilewati karena ukuran cube tidak valid."
@@ -163,16 +162,13 @@ public final class ItemsAdderBedrockGeometryConverter {
 
             cube.add(
                     "size",
-                    vector(
-                            sizeX,
-                            sizeY,
-                            sizeZ
-                    )
+                    vector(sizeX, sizeY, sizeZ)
             );
 
             JsonObject faceUv = new JsonObject();
 
             if (element.faces() != null) {
+
                 for (ItemsAdderModelParser.FaceData face
                         : element.faces()) {
 
@@ -201,20 +197,26 @@ public final class ItemsAdderBedrockGeometryConverter {
 
                     if (!isFinite(u1, v1, u2, v2)) {
                         skippedFaces++;
+
+                        warnings.add(
+                                "Face " + direction
+                                        + " element " + element.index()
+                                        + " dilewati karena UV tidak valid."
+                        );
                         continue;
                     }
 
                     double scaledU1 = u1 * uvScaleX;
                     double scaledV1 = v1 * uvScaleY;
-
                     double scaledU2 = u2 * uvScaleX;
                     double scaledV2 = v2 * uvScaleY;
 
                     double uvWidth = scaledU2 - scaledU1;
                     double uvHeight = scaledV2 - scaledV1;
 
-                    if (Math.abs(uvWidth) < 0.000001
-                            || Math.abs(uvHeight) < 0.000001) {
+                    if (Math.abs(uvWidth) < EPSILON
+                            || Math.abs(uvHeight) < EPSILON) {
+
                         skippedFaces++;
                         continue;
                     }
@@ -223,29 +225,25 @@ public final class ItemsAdderBedrockGeometryConverter {
 
                     uv.add(
                             "uv",
-                            vector(
-                                    scaledU1,
-                                    scaledV1
-                            )
+                            vector(scaledU1, scaledV1)
                     );
 
                     uv.add(
                             "uv_size",
-                            vector(
-                                    uvWidth,
-                                    uvHeight
-                            )
+                            vector(uvWidth, uvHeight)
                     );
 
                     faceUv.add(direction, uv);
 
                     if (face.rotation() != 0) {
+                        unsupportedUvRotations++;
+
                         warnings.add(
-                                "Rotasi UV face "
+                                "Rotasi UV " + face.rotation()
+                                        + " derajat pada face "
                                         + direction
-                                        + " pada element "
-                                        + element.index()
-                                        + " belum dapat diterapkan."
+                                        + " element " + element.index()
+                                        + " belum didukung."
                         );
                     }
 
@@ -254,8 +252,6 @@ public final class ItemsAdderBedrockGeometryConverter {
             }
 
             if (faceUv.isEmpty()) {
-                skippedFaces += 0;
-
                 warnings.add(
                         "Element " + element.index()
                                 + " dilewati karena tidak memiliki UV valid."
@@ -280,6 +276,8 @@ public final class ItemsAdderBedrockGeometryConverter {
                 if (rotation.origin() == null
                         || rotation.origin().size() != 3) {
 
+                    unsupportedRotations++;
+
                     warnings.add(
                             "Rotasi element " + element.index()
                                     + " dilewati karena pivot tidak valid."
@@ -291,6 +289,8 @@ public final class ItemsAdderBedrockGeometryConverter {
                         rotation.origin().get(2),
                         rotation.angle()
                 )) {
+
+                    unsupportedRotations++;
 
                     warnings.add(
                             "Rotasi element " + element.index()
@@ -311,6 +311,7 @@ public final class ItemsAdderBedrockGeometryConverter {
                         bone.add("rotation", rotationArray);
                     } else {
                         unsupportedRotations++;
+
                         warnings.add(
                                 "Rotasi element " + element.index()
                                         + " tidak didukung."
@@ -358,7 +359,14 @@ public final class ItemsAdderBedrockGeometryConverter {
         if (unsupportedRotations > 0) {
             warnings.add(
                     unsupportedRotations
-                            + " rotasi element tidak berhasil dikonversi."
+                            + " rotasi element tidak berhasil diterapkan."
+            );
+        }
+
+        if (unsupportedUvRotations > 0) {
+            warnings.add(
+                    unsupportedUvRotations
+                            + " rotasi UV face belum diterapkan."
             );
         }
 
@@ -371,7 +379,7 @@ public final class ItemsAdderBedrockGeometryConverter {
         );
 
         warnings.add(
-                "Rotasi UV face belum didukung sepenuhnya."
+                "Arah face up/down dipertahankan sesuai orientasi model."
         );
 
         warnings.add(
@@ -488,8 +496,8 @@ public final class ItemsAdderBedrockGeometryConverter {
             case "south" -> "south";
             case "east" -> "east";
             case "west" -> "west";
-            case "up" -> "down";
-            case "down" -> "up";
+            case "up" -> "up";
+            case "down" -> "down";
             default -> null;
         };
     }
